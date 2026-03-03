@@ -1,12 +1,104 @@
 const { WebSocketServer } = require("ws");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
 const PORT = 3000;
 const TURN_MS = 30000;
 const REJOIN_GRACE_MS = 30000;
 const FINISH_TO_LOBBY_MS = 4500;
 const READY_MS = 15000;
+const DEFAULT_STAKE = 100;
 
-const wss = new WebSocketServer({ port: PORT });
+const dataDir = path.join(__dirname, "data");
+const balancesPath = path.join(dataDir, "balances.json");
+
+function loadStore() {
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    if (!fs.existsSync(balancesPath)) {
+      const initial = { users: {}, platform: { earned: 0 } };
+      fs.writeFileSync(balancesPath, JSON.stringify(initial, null, 2), "utf8");
+      return initial;
+    }
+    const parsed = JSON.parse(fs.readFileSync(balancesPath, "utf8") || "{}");
+    if (!parsed.users || typeof parsed.users !== "object") parsed.users = {};
+    if (!parsed.platform || typeof parsed.platform !== "object") parsed.platform = { earned: 0 };
+    if (!Number.isFinite(parsed.platform.earned)) parsed.platform.earned = 0;
+    return parsed;
+  } catch {
+    return { users: {}, platform: { earned: 0 } };
+  }
+}
+
+function saveStoreAtomic(store) {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const tmp = balancesPath + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), "utf8");
+  fs.renameSync(tmp, balancesPath);
+}
+
+const balanceStore = loadStore();
+
+function parseUserId(userKey) {
+  if (!userKey) return null;
+  if (String(userKey).startsWith("tg:")) return String(userKey).slice(3);
+  return String(userKey);
+}
+
+function ensureUserBalance(userId) {
+  if (!userId) return { balance: 0 };
+  if (!balanceStore.users[userId]) balanceStore.users[userId] = { balance: 0 };
+  if (!Number.isFinite(balanceStore.users[userId].balance)) balanceStore.users[userId].balance = 0;
+  return balanceStore.users[userId];
+}
+
+function getBalance(userId) {
+  return ensureUserBalance(userId).balance;
+}
+
+function sendBalanceToWs(ws, userId) {
+  send(ws, { type: "balance", balance: getBalance(userId) });
+}
+
+const server = http.createServer((req, res) => {
+  if (req.method === "POST" && req.url === "/admin/topup") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      try {
+        const payload = JSON.parse(body || "{}");
+        if (!process.env.ADMIN_SECRET || payload.secret !== process.env.ADMIN_SECRET) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "forbidden" }));
+          return;
+        }
+        const userId = safeStr(payload.userId || "", 128);
+        const amount = Number(payload.amount);
+        if (!userId || !Number.isFinite(amount) || amount <= 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "bad_payload" }));
+          return;
+        }
+        ensureUserBalance(userId).balance += amount;
+        saveStoreAtomic(balanceStore);
+        for (const c of wss.clients) {
+          if (c?.userKey && parseUserId(c.userKey) === userId) sendBalanceToWs(c, userId);
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, newBalance: getBalance(userId) }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_json" }));
+      }
+    });
+    return;
+  }
+  res.writeHead(404);
+  res.end("Not found");
+});
+
+const wss = new WebSocketServer({ noServer: true });
 
 /** ======================
  *  Helpers
@@ -53,6 +145,60 @@ function broadcastToRoom(room, data) {
     if (p?.ws && p.ws.readyState === 1) {
       send(p.ws, data);
     }
+  }
+}
+
+function roundMoney(v) {
+  return Math.round((Number(v) || 0) * 100) / 100;
+}
+
+function lockSeatStake(room, role, userKey) {
+  const userId = parseUserId(userKey);
+  if (!userId) return { ok: false, error: "Нет userId" };
+  const stake = Number(room.stake || DEFAULT_STAKE);
+  if (!Number.isFinite(stake) || stake <= 0) return { ok: false, error: "Некорректная ставка" };
+  const user = ensureUserBalance(userId);
+  if (user.balance < stake) return { ok: false, error: "Недостаточно средств" };
+  const fee = roundMoney(stake * 0.1);
+  const pot = roundMoney(stake - fee);
+  user.balance = roundMoney(user.balance - stake);
+  balanceStore.platform.earned = roundMoney((balanceStore.platform.earned || 0) + fee);
+  room.escrow[role] = { userId, stake, pot, fee, locked: true };
+  saveStoreAtomic(balanceStore);
+  return { ok: true, userId };
+}
+
+function refundSeatStake(room, role) {
+  const e = room?.escrow?.[role];
+  if (!e || !e.locked) return;
+  ensureUserBalance(e.userId).balance = roundMoney(getBalance(e.userId) + e.stake);
+  balanceStore.platform.earned = roundMoney((balanceStore.platform.earned || 0) - e.fee);
+  delete room.escrow[role];
+  saveStoreAtomic(balanceStore);
+}
+
+function markHardLose(room, state, role) {
+  if (!state || !role) return;
+  if (!state.hardLoseRoles) state.hardLoseRoles = {};
+  state.hardLoseRoles[role] = true;
+}
+
+function markFinishChanges(room, state) {
+  if (!state || !state.players) return;
+  if (!state.finishedSet) state.finishedSet = {};
+  if (!Array.isArray(state.finishedOrder)) state.finishedOrder = [];
+  const newFinishers = [];
+  for (const role of room.roles) {
+    const handLen = state.players?.[role]?.hand?.length ?? 0;
+    if (handLen === 0 && !state.finishedSet[role]) newFinishers.push(role);
+  }
+  if (newFinishers.length > 0) {
+    for (const role of newFinishers) {
+      state.finishedSet[role] = true;
+      state.finishedOrder.push(role);
+    }
+    state.lastFinishGroup = newFinishers;
+    if (!state.mainWinner) state.mainWinner = state.finishedOrder[0] || null;
   }
 }
 
@@ -341,6 +487,7 @@ function normalizeTurn(room, state) {
   if (isOutRole(room, state, state.defender) || state.defender === state.attacker) {
     state.defender = nextActiveRole(room, state, state.attacker);
   }
+  if (state.defender) state.lastDefenderRole = state.defender;
 }
 
 function resetTakingPass(room, state) {
@@ -366,9 +513,10 @@ function finalizeTakingRound(room, state, defender) {
     }
     state.table = [null,null,null,null,null,null];
 
-    if (checkImmediateClassicWin(room, state)) return state;
-
     dealRound(state, room);
+    markFinishChanges(room, state);
+
+    if (checkImmediateClassicWin(room, state)) return state;
 
     state.attacker = nextActiveRole(room, state, defender);
     state.defender = nextActiveRole(room, state, state.attacker);
@@ -380,9 +528,10 @@ function finalizeTakingRound(room, state, defender) {
     }
     state.table = [null,null,null,null,null,null];
 
-    if (checkImmediateClassicWin(room, state)) return state;
-
     dealRound(state, room);
+    markFinishChanges(room, state);
+
+    if (checkImmediateClassicWin(room, state)) return state;
 
     state.attacker = defender;
     if (isOutRole(room, state, state.attacker)) state.attacker = nextActiveRole(room, state, state.attacker);
@@ -394,6 +543,7 @@ function finalizeTakingRound(room, state, defender) {
   state.message = "";
   state.takingReason = null;
   resetTakingPass(room, state);
+  if (state.defender) state.lastDefenderRole = state.defender;
 
   checkFinish(room, state);
   return state;
@@ -429,6 +579,8 @@ function finishFirstOut(state, room, winners) {
   state.phase = "finished";
   state.winners = winnerList;
   state.loser = room.roles.find(r => !winnerList.includes(r)) || null;
+  state.losers = state.loser ? [state.loser] : [];
+  state.finishMode = room.winMode;
   state.message = winnerList.length > 1 ? "Победа: несколько игроков без карт." : "Победа: первый без карт.";
   state.activeRole = null;
   state.deadlineTs = null;
@@ -438,6 +590,8 @@ function finishClassic(state, room, loser) {
   state.phase = "finished";
   state.loser = loser;
   state.winners = room.roles.filter(r => r !== loser);
+  state.losers = loser ? [loser] : [];
+  state.finishMode = "classic";
   state.message = loser ? "Игра окончена." : "Ничья.";
   state.activeRole = null;
   state.deadlineTs = null;
@@ -447,6 +601,8 @@ function finishClassicImmediate(state, room, winner) {
   state.phase = "finished";
   state.loser = null;
   state.winners = winner ? [winner] : [];
+  state.losers = [];
+  state.finishMode = "classic";
   state.message = "Победа.";
   state.activeRole = null;
   state.deadlineTs = null;
@@ -454,8 +610,12 @@ function finishClassicImmediate(state, room, winner) {
 
 function finishDraw(state, room) {
   state.phase = "finished";
+  const losers = Array.isArray(state.lastFinishGroup) ? state.lastFinishGroup.slice() : [];
+  const winners = room.roles.filter(r => !losers.includes(r));
   state.loser = null;
-  state.winners = room.roles.slice();
+  state.losers = losers;
+  state.winners = winners;
+  state.finishMode = "draw";
   state.message = "Ничья.";
   state.activeRole = null;
   state.deadlineTs = null;
@@ -464,10 +624,19 @@ function finishDraw(state, room) {
 function checkImmediateClassicWin(room, state) {
   if (state.phase === "finished") return true;
   if (room.winMode !== "classic") return false;
-  const winner = room.roles.find(r => (state.players?.[r]?.hand?.length || 0) === 0);
-  if (!winner) return false;
-  finishClassicImmediate(state, room, winner);
-  return true;
+  const withCards = room.roles.filter(r => (state.players?.[r]?.hand?.length || 0) > 0);
+  if (withCards.length === 1) {
+    finishClassic(state, room, withCards[0]);
+    return true;
+  }
+  if (withCards.length === 0) {
+    const fallbackLoser = state.lastDefenderRole && room.roles.includes(state.lastDefenderRole)
+      ? state.lastDefenderRole
+      : (room.roles[0] || null);
+    finishClassic(state, room, fallbackLoser);
+    return true;
+  }
+  return false;
 }
 
 function checkFinish(room, state) {
@@ -479,6 +648,8 @@ function checkFinish(room, state) {
     state.phase = "finished";
     state.winners = only ? [only] : [];
     state.loser = null;
+    state.losers = [];
+    state.finishMode = room.winMode;
     state.message = "Игра окончена.";
     state.activeRole = null;
     state.deadlineTs = null;
@@ -500,10 +671,10 @@ function checkFinish(room, state) {
   }
 
   if (room.winMode === "draw") {
+    markFinishChanges(room, state);
     if (state.deck.length > 0) return false;
     const withCards = room.roles.filter(r => state.players[r].hand.length > 0);
     if (withCards.length === 0) { finishDraw(state, room); return true; }
-    if (withCards.length === 1) { finishClassic(state, room, withCards[0]); return true; }
     return false;
   }
 
@@ -531,6 +702,15 @@ function createNewGame(room) {
     message: "",
     winners: [],
     loser: null,
+    losers: [],
+    mainWinner: null,
+    finishMode: room.winMode,
+    payoutBreakdown: null,
+    hardLoseRoles: {},
+    finishedSet: {},
+    finishedOrder: [],
+    lastFinishGroup: [],
+    lastDefenderRole: nextRole(room, room.roles[0]),
     activeRole: null,
     deadlineTs: null,
     takingPass: {},
@@ -547,7 +727,76 @@ function createNewGame(room) {
     state.defender = nextRole(room, firstAttacker);
   }
 
+  state.lastDefenderRole = state.defender;
+  markFinishChanges(room, state);
+
   return state;
+}
+
+function settleRoomPayouts(room, state) {
+  if (!state || state.payoutBreakdown) return;
+  const mode = room.winMode;
+  const roles = Object.keys(room.escrow || {});
+  const N = roles.length;
+  const S = Number(room.stake || DEFAULT_STAKE);
+  const basePool = roundMoney(0.9 * N * S);
+  const winners = Array.isArray(state.winners) ? state.winners.slice() : [];
+  const losers = Array.isArray(state.losers) && state.losers.length ? state.losers.slice() : (state.loser ? [state.loser] : []);
+  let mainWinner = state.mainWinner || (state.finishedOrder?.[0] || null);
+  if (mainWinner && !winners.includes(mainWinner)) mainWinner = winners[0] || null;
+
+  let winnersPool = basePool;
+  let platformEarnedDelta = 0;
+  const perRole = {};
+  const hardLoseRoles = state.hardLoseRoles || {};
+  for (const role of roles) {
+    const e = room.escrow?.[role] || null;
+    perRole[role] = {
+      userId: e?.userId || null,
+      stake: e?.stake || S,
+      fee: e?.fee || roundMoney(S * 0.1),
+      pot: e?.pot || roundMoney(S * 0.9),
+      hardLose: !!hardLoseRoles[role],
+      payout: 0,
+      refund: 0
+    };
+  }
+
+  if (mode === "draw") {
+    let nonHardK = 0;
+    for (const role of losers) {
+      if (hardLoseRoles[role]) continue;
+      nonHardK += 1;
+      const refund = roundMoney(0.5 * S);
+      perRole[role].refund = refund;
+      ensureUserBalance(perRole[role].userId).balance = roundMoney(getBalance(perRole[role].userId) + refund);
+      const feeDelta = roundMoney(0.25 * S);
+      balanceStore.platform.earned = roundMoney((balanceStore.platform.earned || 0) + feeDelta);
+      platformEarnedDelta = roundMoney(platformEarnedDelta + feeDelta);
+    }
+    winnersPool = roundMoney(basePool - (0.25 * nonHardK * S));
+  }
+
+  const W = winners.length;
+  if (W > 0) {
+    const totalShares = W + 1;
+    const mw = mainWinner || winners[0];
+    for (const role of winners) {
+      const share = role === mw ? 2 / totalShares : 1 / totalShares;
+      const payout = roundMoney(winnersPool * share);
+      perRole[role].payout = roundMoney(perRole[role].payout + payout);
+      ensureUserBalance(perRole[role].userId).balance = roundMoney(getBalance(perRole[role].userId) + payout);
+    }
+  } else {
+    balanceStore.platform.earned = roundMoney((balanceStore.platform.earned || 0) + winnersPool);
+    platformEarnedDelta = roundMoney(platformEarnedDelta + winnersPool);
+  }
+
+  saveStoreAtomic(balanceStore);
+  state.payoutBreakdown = { mode, N, S, basePool, winnersPool, winners, losers, mainWinner: mainWinner || null, perRole, platformEarnedDelta };
+  for (const p of room.players || []) {
+    if (p?.ws && p.userKey) sendBalanceToWs(p.ws, parseUserId(p.userKey));
+  }
 }
 
 function removeRoleFromGame(room, state, role, toDiscard = true) {
@@ -608,6 +857,8 @@ function applyAction(room, state, role, action) {
       state.phase = "finished";
       state.winners = [room.roles.find(r => r !== role)];
       state.loser = role;
+      state.losers = [role];
+      state.finishMode = room.winMode;
       state.message = "Сдача.";
       state.activeRole = null;
       state.deadlineTs = null;
@@ -636,6 +887,8 @@ function applyAction(room, state, role, action) {
     state.phase = "finished";
     state.winners = room.roles.filter(r => r !== role);
     state.loser = role;
+    state.losers = [role];
+    state.finishMode = room.winMode;
     state.message = "Сдача.";
     state.activeRole = null;
     state.deadlineTs = null;
@@ -660,6 +913,7 @@ function applyAction(room, state, role, action) {
 
     hand.splice(idx, 1);
     state.table[free] = { attack: card, defend: null };
+    markFinishChanges(room, state);
 
     // defender becomes attacker, next player becomes defender
     const oldDef = state.defender;
@@ -698,6 +952,7 @@ function applyAction(room, state, role, action) {
       if (free === -1) return null;
       const card = hand.splice(idx, 1)[0];
       state.table[free] = { attack: card, defend: null };
+      markFinishChanges(room, state);
       state.phase = "defend";
       state.message = "";
       if (checkImmediateClassicWin(room, state)) return state;
@@ -718,6 +973,7 @@ function applyAction(room, state, role, action) {
 
     const card = hand.splice(idx, 1)[0];
     state.table[free] = { attack: card, defend: null };
+    markFinishChanges(room, state);
     state.phase = "defend";
     state.message = "";
     if (checkImmediateClassicWin(room, state)) return state;
@@ -747,6 +1003,7 @@ function applyAction(room, state, role, action) {
     if (!cardBeats(state.trumpSuit, defCard, pair.attack)) return null;
 
     pair.defend = hand.splice(idx, 1)[0];
+    markFinishChanges(room, state);
 
 	if (state.table.filter(Boolean).every(p => p.defend)) {
       state.phase = "taking";
@@ -875,6 +1132,7 @@ function onTimeout(room) {
 
   // resign active
   const next = applyAction(room, state, active, { kind:"resign" });
+  if (active === state.attacker) markHardLose(room, state, active);
   if (next) room.state = next;
   clearRoomTimer(room);
   broadcastGameState(room);
@@ -933,8 +1191,13 @@ function sanitizeStateFor(room, role, state) {
     handsCount,
     winners: state.winners || [],
     loser: state.loser || null,
+    losers: state.losers || [],
+    mainWinner: state.mainWinner || null,
+    finishMode: state.finishMode || room.winMode,
     winnersSeat: (state.winners || []).map(r => room.roles.indexOf(r)).filter(i => i >= 0),
-    loserSeat: state.loser ? (room.roles.indexOf(state.loser) >= 0 ? room.roles.indexOf(state.loser) : null) : null
+    loserSeat: state.loser ? (room.roles.indexOf(state.loser) >= 0 ? room.roles.indexOf(state.loser) : null) : null,
+    losersSeat: (state.losers || []).map(r => room.roles.indexOf(r)).filter(i => i >= 0),
+    payoutBreakdown: state.payoutBreakdown || null
   };
 }
 
@@ -1005,6 +1268,7 @@ function broadcastGameState(room) {
 
   // if finished -> schedule reset back to lobby mode
   if (state.phase === "finished") {
+    settleRoomPayouts(room, state);
     clearRoomTimer(room);
     scheduleFinishToLobby(room);
   }
@@ -1062,6 +1326,7 @@ function attachToRoomByUserKey(ws, userKey, profile) {
     scheduleReadyCountdown(room);
     sendLobbyState(room);
   }
+  sendBalanceToWs(ws, parseUserId(userKey));
   return true;
 }
 
@@ -1103,6 +1368,7 @@ function leaveRoom(ws) {
       userToRoom.delete(userKey);
 
       const st = room.state;
+      markHardLose(room, st, still.role);
       const next = applyAction(room, st, still.role, { kind:"resign" });
       if (next) room.state = next;
 
@@ -1124,6 +1390,7 @@ function leaveRoom(ws) {
 
   // lobby or finished state: remove immediately
   userToRoom.delete(userKey);
+  refundSeatStake(room, pl.role);
   room.players = room.players.filter(p => p.userKey !== userKey);
   if (room.players.length === 0) {
     deleteRoomIfEmpty(room);
@@ -1150,6 +1417,7 @@ function createRoomForHost({ hostWs, userKey, profile, maxPlayers, winMode, allo
     winMode,
     allowTransfer: !!allowTransfer,
     throwInMode: throwInMode || "all",
+    stake: DEFAULT_STAKE,
     roles,
     createdAt: now(),
     startedAt: null,
@@ -1159,8 +1427,15 @@ function createRoomForHost({ hostWs, userKey, profile, maxPlayers, winMode, allo
     disconnectTimers: new Map(),
     finishResetTimer: null,
     readyTimer: null,
-    readyDeadlineTs: null
+    readyDeadlineTs: null,
+    escrow: {}
   };
+
+  const lock = lockSeatStake(room, "p1", userKey);
+  if (!lock.ok) {
+    send(hostWs, { type:"error", message: lock.error || "Недостаточно средств" });
+    return null;
+  }
 
   const host = { ws: hostWs, userKey, role:"p1", profile, ready:false };
   room.players.push(host);
@@ -1172,6 +1447,7 @@ function createRoomForHost({ hostWs, userKey, profile, maxPlayers, winMode, allo
   hostWs.userKey = userKey;
 
   send(hostWs, { type:"lobby_created", roomId, youRole:"p1" });
+  sendBalanceToWs(hostWs, parseUserId(userKey));
   scheduleReadyCountdown(room);
   sendLobbyState(room);
   broadcastLobbyLists();
@@ -1210,6 +1486,7 @@ function joinRoom({ ws, userKey, profile, roomId, password }) {
     }
 
     send(ws, { type:"joined", roomId: room.id, youRole: existing.role });
+    sendBalanceToWs(ws, parseUserId(userKey));
     if (room.state) send(ws, { type:"state", state: sanitizeStateFor(room, existing.role, room.state) });
     else {
       scheduleReadyCountdown(room);
@@ -1236,11 +1513,18 @@ function joinRoom({ ws, userKey, profile, roomId, password }) {
   }
 
   room.players.push({ ws, userKey, role: free, profile, ready:false });
+  const lock = lockSeatStake(room, free, userKey);
+  if (!lock.ok) {
+    room.players = room.players.filter(p => !(p.userKey === userKey && p.role === free));
+    send(ws, { type:"error", message: lock.error || "Недостаточно средств" });
+    return null;
+  }
   userToRoom.set(userKey, room.id);
   ws.roomId = room.id;
   ws.userKey = userKey;
 
   send(ws, { type:"joined", roomId: room.id, youRole: free });
+  sendBalanceToWs(ws, parseUserId(userKey));
 
   if (room.state) send(ws, { type:"state", state: sanitizeStateFor(room, free, room.state) });
   else {
@@ -1276,6 +1560,7 @@ wss.on("connection", (ws) => {
       if (attachToRoomByUserKey(ws, userKey, profile)) return;
 
       ws.userKey = userKey;
+      sendBalanceToWs(ws, parseUserId(userKey));
       send(ws, { type:"lobbies", ...buildLobbyLists() });
       return;
     }
@@ -1343,6 +1628,8 @@ wss.on("connection", (ws) => {
         isPrivate: false,
         password: ""
       });
+
+      if (!room) return;
 
       send(ws, { type:"quick_status", searching:false, matched:true, roomId: room.id });
       return;
@@ -1429,6 +1716,7 @@ wss.on("connection", (ws) => {
       }
 
       userToRoom.delete(userKey);
+      refundSeatStake(room, pl.role);
       room.players = room.players.filter(p => p.userKey !== userKey);
       ws.roomId = null;
 
@@ -1500,4 +1788,16 @@ wss.on("connection", (ws) => {
   });
 });
 
-console.log(`🃏 Durak WS started on ws://0.0.0.0:${PORT}`);
+server.on("upgrade", (req, socket, head) => {
+  if (req.url !== "/ws") {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🃏 Durak WS started on ws://0.0.0.0:${PORT}/ws`);
+});
