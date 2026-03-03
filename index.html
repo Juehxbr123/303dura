@@ -451,25 +451,16 @@
       100% { transform: translate(-50%,-50%) scale(1); opacity:0; }
     }
 
-    /* End badges (crown/skull) zoom + fade */
-    .endBadge{
+    .avatarBadge{
       position:absolute;
       left:50%;
-      top:-24px;
-      transform: translate(-50%,0) scale(0);
-      font-size: 50px;
+      top:-10px;
+      transform: translateX(-50%);
+      font-size: 20px;
       line-height: 1;
-      opacity: 0;
       pointer-events:none;
-      filter: drop-shadow(0 8px 10px rgba(0,0,0,.35));
-      animation: endBadgePop 3s ease-out forwards;
+      filter: drop-shadow(0 4px 6px rgba(0,0,0,.35));
       z-index: 4;
-    }
-    @keyframes endBadgePop{
-      0%   { transform: translate(-50%,0) scale(0); opacity:0; }
-      12%  { transform: translate(-50%,0) scale(1); opacity:1; }
-      70%  { transform: translate(-50%,0) scale(1); opacity:1; }
-      100% { transform: translate(-50%,0) scale(1); opacity:0; }
     }
 
     .enemy .avatarInner img{width:100%; height:100%; object-fit:cover;}
@@ -888,6 +879,13 @@
 
         <div style="height:12px;"></div>
 
+        <div class="row" style="justify-content:space-between; gap:10px; align-items:center;">
+          <div class="muted">Баланс: <b id="balanceVal">0</b></div>
+          <button class="btn gray" id="btnTopup">Пополнить</button>
+        </div>
+
+        <div style="height:12px;"></div>
+
         <div class="row" style="justify-content:space-between; gap:12px;">
           <div class="col" style="flex:1; min-width: 220px;">
             <div class="muted">Быстрая игра</div>
@@ -1179,6 +1177,12 @@
     return false;
   }
   renderProfile();
+  let currentBalance = 0;
+  const balanceVal = document.getElementById("balanceVal");
+  function renderBalance() {
+    balanceVal.textContent = Number(currentBalance || 0).toFixed(2);
+  }
+  renderBalance();
   if (inTG) {
     let tries = 0;
     const poll = setInterval(() => {
@@ -1312,6 +1316,12 @@
         return;
       }
 
+      if (msg.type === "balance") {
+        currentBalance = Number(msg.balance) || 0;
+        renderBalance();
+        return;
+      }
+
       if (msg.type === "lobby_created" || msg.type === "joined") {
         if (msg.roomId) {
           roomId = msg.roomId;
@@ -1382,6 +1392,31 @@
   };
   btnQuickCancel.onclick = () => {
     sendMsg({ type:"quick_cancel", userKey });
+  };
+
+  const btnTopup = document.getElementById("btnTopup");
+  btnTopup.onclick = async () => {
+    const devSecret = localStorage.getItem("dev_admin_secret") || "";
+    const userId = (inTG && tg.initDataUnsafe?.user?.id) ? String(tg.initDataUnsafe.user.id) : String(userKey || "").replace(/^tg:/, "");
+    if (devSecret) {
+      const amount = Number(prompt("Сумма пополнения", "100") || "0");
+      if (!Number.isFinite(amount) || amount <= 0) return;
+      try {
+        const resp = await fetch("/admin/topup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId, amount, secret: devSecret })
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || "topup_failed");
+        currentBalance = Number(data.newBalance) || currentBalance;
+        renderBalance();
+      } catch {
+        alert("Ошибка пополнения");
+      }
+      return;
+    }
+    alert("Пополнить TON\nПополнить Stars");
   };
 
   // ===== Create lobby
@@ -1814,6 +1849,10 @@
       ava.textContent = (prof.name || "P").slice(0,1).toUpperCase();
     }
     wrap.appendChild(ava);
+    const badge = document.createElement("div");
+    badge.className = "avatarBadge";
+    badge.textContent = "";
+    wrap.appendChild(badge);
 
     const nm = document.createElement("div");
     nm.className = "name";
@@ -1836,6 +1875,7 @@
     }
 	e._avatar = ava;
     e._avatarWrap = wrap;
+    e._badge = badge;
     wrap.style.pointerEvents = "none";
     return e;
   }
@@ -1924,66 +1964,23 @@
   let lastFinishKey = null;
   function applyEndBadges(st){
     if (!st || st.phase !== "finished") return;
-    const key = JSON.stringify({ winners: st.winners || [], loser: st.loser || null, winnersSeat: st.winnersSeat || [], loserSeat: st.loserSeat ?? null });
+    const key = JSON.stringify({ winners: st.winners || [], losers: st.losers || [], winnersSeat: st.winnersSeat || [], losersSeat: st.losersSeat || [], loserSeat: st.loserSeat ?? null, finishMode: st.finishMode || st.winMode });
     if (key === lastFinishKey) return;
     lastFinishKey = key;
 
-    // чистим старые
-    document.querySelectorAll(".endBadge").forEach(n => n.remove());
+    document.querySelectorAll(".avatarBadge").forEach(n => { n.textContent = ""; });
 
-    const roles = Array.isArray(st.roles) ? st.roles : [];
-    const winners = Array.isArray(st.winners) ? st.winners : [];
-    const winnersSeat = Array.isArray(st.winnersSeat) ? st.winnersSeat : [];
-    const loserSeat = Number.isFinite(st.loserSeat) ? st.loserSeat : null;
-    const roleToSeat = new Map(roles.map((r, idx) => [r, idx]));
-    const renderedSeats = new Set();
+    const winnersSeat = Array.isArray(st.winnersSeat) ? st.winnersSeat.filter(Number.isFinite) : [];
+    let losersSeat = Array.isArray(st.losersSeat) ? st.losersSeat.filter(Number.isFinite) : [];
+    if (!losersSeat.length && Number.isFinite(st.loserSeat)) losersSeat = [st.loserSeat];
 
-    if (st.winMode === "classic") {
-      // классик: победитель 1-й, проигравшие все остальные
-      const winner = winners[0] || null;
-      if (Number.isFinite(winnersSeat[0])) addBadge({ seat: winnersSeat[0] }, "👑");
-      else if (winner) addBadge({ role: winner }, "👑");
-      for (const r of roles) {
-        if (!r) continue;
-        if (winner && r === winner) continue;
-        if (Number.isFinite(loserSeat) && roleToSeat.get(r) === loserSeat) {
-          addBadge({ seat: loserSeat }, "💀");
-        } else {
-          addBadge({ role: r }, "💀");
-        }
-      }
-      return;
+    for (const seat of winnersSeat) {
+      const b = document.querySelector(`.avatarWrap[data-seat="${seat}"] .avatarBadge`);
+      if (b) b.textContent = "👑";
     }
-
-    // ничья-режим: проигравший последний (1 человек), остальные победители
-    if (Number.isFinite(loserSeat)) addBadge({ seat: loserSeat }, "💀");
-    for (const seat of winnersSeat) addBadge({ seat }, "👑");
-    if (!winnersSeat.length) {
-      const loser = st.loser || null;
-      if (loser) addBadge({ role: loser }, "💀");
-      for (const r of roles) {
-        if (!r || r === loser) continue;
-        addBadge({ role: r }, "👑");
-      }
-      return;
-    }
-
-    function addBadge({ role, seat }, emoji){
-      if (Number.isFinite(seat)) {
-        if (renderedSeats.has(seat)) return;
-        renderedSeats.add(seat);
-      }
-      let ava = null;
-      if (Number.isFinite(seat)) ava = document.querySelector(`.avatarWrap[data-seat="${seat}"]`);
-      if (!ava && role) ava = document.querySelector(`.avatarWrap[data-role="${cssEscape(role)}"]`);
-      if (!ava) return;
-      const b = document.createElement("div");
-      b.className = "endBadge";
-      b.textContent = emoji;
-      ava.appendChild(b);
-      const cleanup = () => { try { b.remove(); } catch {} };
-      b.addEventListener("animationend", cleanup, { once: true });
-      setTimeout(cleanup, 3200);
+    for (const seat of losersSeat) {
+      const b = document.querySelector(`.avatarWrap[data-seat="${seat}"] .avatarBadge`);
+      if (b) b.textContent = "💀";
     }
   }
 
@@ -2141,7 +2138,10 @@
     renderTransferZone(gameState);
     renderHand(gameState);
     renderFinish(gameState);
-    if (gameState.phase !== "finished") lastFinishKey = null;
+    if (gameState.phase !== "finished") {
+      lastFinishKey = null;
+      document.querySelectorAll(".avatarBadge").forEach(n => { n.textContent = ""; });
+    }
 	applyEndBadges(gameState);
 
 
