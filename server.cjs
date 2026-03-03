@@ -8,26 +8,57 @@ const TURN_MS = 30000;
 const REJOIN_GRACE_MS = 30000;
 const FINISH_TO_LOBBY_MS = 4500;
 const READY_MS = 15000;
-const DEFAULT_STAKE = 100;
+const DEFAULT_STAKE = 1;
+const DEFAULT_CURRENCY = "ton";
 
 const dataDir = path.join(__dirname, "data");
 const balancesPath = path.join(dataDir, "balances.json");
+const ordersPath = path.join(dataDir, "orders.json");
 
 function loadStore() {
   try {
     fs.mkdirSync(dataDir, { recursive: true });
     if (!fs.existsSync(balancesPath)) {
-      const initial = { users: {}, platform: { earned: 0 } };
+      const initial = { users: {}, platform: { earned: { ton: 0, stars: 0 } } };
       fs.writeFileSync(balancesPath, JSON.stringify(initial, null, 2), "utf8");
       return initial;
     }
     const parsed = JSON.parse(fs.readFileSync(balancesPath, "utf8") || "{}");
     if (!parsed.users || typeof parsed.users !== "object") parsed.users = {};
-    if (!parsed.platform || typeof parsed.platform !== "object") parsed.platform = { earned: 0 };
-    if (!Number.isFinite(parsed.platform.earned)) parsed.platform.earned = 0;
+    if (!parsed.platform || typeof parsed.platform !== "object") parsed.platform = { earned: { ton: 0, stars: 0 } };
+    if (!parsed.platform.earned || typeof parsed.platform.earned !== "object") parsed.platform.earned = { ton: 0, stars: 0 };
+    if (!Number.isFinite(parsed.platform.earned.ton)) parsed.platform.earned.ton = 0;
+    if (!Number.isFinite(parsed.platform.earned.stars)) parsed.platform.earned.stars = 0;
+    for (const userId of Object.keys(parsed.users)) {
+      const u = parsed.users[userId] || {};
+      if (!u.balances || typeof u.balances !== "object") {
+        const old = Number(u.balance) || 0;
+        u.balances = { ton: old, stars: 0 };
+      }
+      if (!Number.isFinite(u.balances.ton)) u.balances.ton = 0;
+      if (!Number.isFinite(u.balances.stars)) u.balances.stars = 0;
+      delete u.balance;
+      parsed.users[userId] = u;
+    }
     return parsed;
   } catch {
-    return { users: {}, platform: { earned: 0 } };
+    return { users: {}, platform: { earned: { ton: 0, stars: 0 } } };
+  }
+}
+
+function loadOrders() {
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    if (!fs.existsSync(ordersPath)) {
+      const initial = { orders: {} };
+      fs.writeFileSync(ordersPath, JSON.stringify(initial, null, 2), "utf8");
+      return initial;
+    }
+    const parsed = JSON.parse(fs.readFileSync(ordersPath, "utf8") || "{}");
+    if (!parsed.orders || typeof parsed.orders !== "object") parsed.orders = {};
+    return parsed;
+  } catch {
+    return { orders: {} };
   }
 }
 
@@ -39,6 +70,14 @@ function saveStoreAtomic(store) {
 }
 
 const balanceStore = loadStore();
+const ordersStore = loadOrders();
+
+function saveOrdersAtomic(store) {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const tmp = ordersPath + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), "utf8");
+  fs.renameSync(tmp, ordersPath);
+}
 
 function parseUserId(userKey) {
   if (!userKey) return null;
@@ -47,18 +86,44 @@ function parseUserId(userKey) {
 }
 
 function ensureUserBalance(userId) {
-  if (!userId) return { balance: 0 };
-  if (!balanceStore.users[userId]) balanceStore.users[userId] = { balance: 0 };
-  if (!Number.isFinite(balanceStore.users[userId].balance)) balanceStore.users[userId].balance = 0;
+  if (!userId) return { username: "", name: "", balances: { ton: 0, stars: 0 } };
+  if (!balanceStore.users[userId]) balanceStore.users[userId] = { username: "", name: "", balances: { ton: 0, stars: 0 } };
+  const row = balanceStore.users[userId];
+  if (!row.balances || typeof row.balances !== "object") row.balances = { ton: 0, stars: 0 };
+  if (!Number.isFinite(row.balances.ton)) row.balances.ton = 0;
+  if (!Number.isFinite(row.balances.stars)) row.balances.stars = 0;
+  if (typeof row.username !== "string") row.username = "";
+  if (typeof row.name !== "string") row.name = "";
   return balanceStore.users[userId];
 }
 
-function getBalance(userId) {
-  return ensureUserBalance(userId).balance;
+function getBalances(userId) {
+  const b = ensureUserBalance(userId).balances;
+  return { ton: Number(b.ton) || 0, stars: Number(b.stars) || 0 };
 }
 
 function sendBalanceToWs(ws, userId) {
-  send(ws, { type: "balance", balance: getBalance(userId) });
+  send(ws, { type: "balance", balances: getBalances(userId) });
+}
+
+function pushBalanceToUser(userId) {
+  for (const c of wss.clients) {
+    if (c?.userKey && parseUserId(c.userKey) === userId) sendBalanceToWs(c, userId);
+  }
+}
+
+function normalizeCurrency(v) {
+  const c = String(v || "").toLowerCase();
+  return c === "stars" ? "stars" : (c === "ton" ? "ton" : null);
+}
+
+function setUserMetaFromProfile(userId, profile) {
+  if (!userId || !profile) return;
+  const row = ensureUserBalance(userId);
+  const username = String(profile.username || "").replace(/^@/, "").trim().toLowerCase();
+  row.username = username;
+  row.name = safeStr(profile.name || "", 64);
+  saveStoreAtomic(balanceStore);
 }
 
 const server = http.createServer((req, res) => {
@@ -74,19 +139,216 @@ const server = http.createServer((req, res) => {
           return;
         }
         const userId = safeStr(payload.userId || "", 128);
+        const currency = normalizeCurrency(payload.currency);
         const amount = Number(payload.amount);
-        if (!userId || !Number.isFinite(amount) || amount <= 0) {
+        if (!userId || !currency || !Number.isFinite(amount) || amount <= 0) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: "bad_payload" }));
           return;
         }
-        ensureUserBalance(userId).balance += amount;
+        ensureUserBalance(userId).balances[currency] = roundMoney(ensureUserBalance(userId).balances[currency] + amount);
         saveStoreAtomic(balanceStore);
-        for (const c of wss.clients) {
-          if (c?.userKey && parseUserId(c.userKey) === userId) sendBalanceToWs(c, userId);
+        pushBalanceToUser(userId);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, balances: getBalances(userId) }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_json" }));
+      }
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/admin/grant_username") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      try {
+        const payload = JSON.parse(body || "{}");
+        if (!process.env.ADMIN_SECRET || payload.secret !== process.env.ADMIN_SECRET) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "forbidden" }));
+          return;
+        }
+        const currency = normalizeCurrency(payload.currency);
+        const amount = Number(payload.amount);
+        const username = String(payload.username || "").replace(/^@/, "").trim().toLowerCase();
+        if (!username || !currency || !Number.isFinite(amount) || amount <= 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "bad_payload" }));
+          return;
+        }
+        const matched = Object.keys(balanceStore.users).filter(uid => String(balanceStore.users[uid]?.username || "") === username);
+        if (matched.length === 0) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "user_not_found" }));
+          return;
+        }
+        if (matched.length > 1) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "ambiguous_username" }));
+          return;
+        }
+        const userId = matched[0];
+        ensureUserBalance(userId).balances[currency] = roundMoney(ensureUserBalance(userId).balances[currency] + amount);
+        saveStoreAtomic(balanceStore);
+        pushBalanceToUser(userId);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, userId, balances: getBalances(userId) }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_json" }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/pay/stars/link") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", async () => {
+      try {
+        if (!process.env.BOT_TOKEN) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "bot_token_missing" }));
+          return;
+        }
+        const payload = JSON.parse(body || "{}");
+        const userId = safeStr(payload.userId || "", 128);
+        const stars = Number(payload.stars);
+        if (!userId || !Number.isInteger(stars) || stars < 50 || stars % 50 !== 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "bad_payload" }));
+          return;
+        }
+        const nonce = randId("N");
+        const invoicePayload = `topup_stars:${userId}:${stars}:${nonce}`;
+        const r = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/createInvoiceLink`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "Top up Stars",
+            description: `Top up ${stars} Stars`,
+            payload: invoicePayload,
+            currency: "XTR",
+            prices: [{ label: "Top up", amount: stars }]
+          })
+        });
+        const j = await r.json();
+        if (!j.ok || !j.result) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "tg_create_invoice_failed" }));
+          return;
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, newBalance: getBalance(userId) }));
+        res.end(JSON.stringify({ ok: true, url: j.result }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_json" }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/pay/ton/order") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      try {
+        if (!process.env.TON_RECEIVER) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "ton_receiver_missing" }));
+          return;
+        }
+        const payload = JSON.parse(body || "{}");
+        const userId = safeStr(payload.userId || "", 128);
+        const ton = Number(payload.ton);
+        if (!userId || !Number.isInteger(ton) || ton < 1 || ton % 1 !== 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "bad_payload" }));
+          return;
+        }
+        const orderId = randId("TON");
+        const amountNano = String(BigInt(Math.round(ton * 1e9)));
+        const comment = `EVILTOPUP:${orderId}:${userId}`;
+        ordersStore.orders[orderId] = { orderId, userId, ton, amountNano, comment, status: "pending", createdAt: now(), txHash: null };
+        saveOrdersAtomic(ordersStore);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, orderId, to: process.env.TON_RECEIVER, amountNano, comment }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad_json" }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/pay/ton/confirm") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", async () => {
+      try {
+        if (!process.env.TON_RECEIVER) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "ton_receiver_missing" }));
+          return;
+        }
+        if (!process.env.TONCENTER_API_KEY) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "toncenter_api_key_missing" }));
+          return;
+        }
+        const payload = JSON.parse(body || "{}");
+        const orderId = safeStr(payload.orderId || "", 128);
+        const userId = safeStr(payload.userId || "", 128);
+        const ord = ordersStore.orders[orderId];
+        if (!ord || ord.userId !== userId) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "not_found" }));
+          return;
+        }
+        if (ord.status === "paid") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, balances: getBalances(userId), alreadyPaid: true }));
+          return;
+        }
+
+        const txResp = await fetch(`https://toncenter.com/api/v2/getTransactions?address=${encodeURIComponent(process.env.TON_RECEIVER)}&limit=50&to_lt=0&archival=true`, {
+          headers: { "X-API-Key": process.env.TONCENTER_API_KEY }
+        });
+        const txJson = await txResp.json();
+        const txs = Array.isArray(txJson?.result) ? txJson.result : [];
+        const targetComment = `EVILTOPUP:${orderId}:${userId}`;
+        const minNano = BigInt(ord.amountNano);
+        let foundHash = null;
+        for (const tx of txs) {
+          const inMsg = tx?.in_msg || {};
+          const value = BigInt(String(inMsg.value || "0"));
+          const msg = String(inMsg.message || inMsg.msg_data?.text || "");
+          if (value >= minNano && msg.includes(targetComment)) {
+            foundHash = tx?.transaction_id?.hash || tx?.hash || randId("tx");
+            break;
+          }
+        }
+        if (!foundHash) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "not_found" }));
+          return;
+        }
+        const duplicate = Object.values(ordersStore.orders).find(o => o && o.status === "paid" && o.txHash === foundHash);
+        if (duplicate) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "already_used_tx" }));
+          return;
+        }
+        ord.status = "paid";
+        ord.paidAt = now();
+        ord.txHash = foundHash;
+        ensureUserBalance(userId).balances.ton = roundMoney(ensureUserBalance(userId).balances.ton + Number(ord.ton));
+        saveOrdersAtomic(ordersStore);
+        saveStoreAtomic(balanceStore);
+        pushBalanceToUser(userId);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, balances: getBalances(userId) }));
       } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "bad_json" }));
@@ -156,14 +418,16 @@ function lockSeatStake(room, role, userKey) {
   const userId = parseUserId(userKey);
   if (!userId) return { ok: false, error: "Нет userId" };
   const stake = Number(room.stake || DEFAULT_STAKE);
+  const currency = normalizeCurrency(room.currency || DEFAULT_CURRENCY);
   if (!Number.isFinite(stake) || stake <= 0) return { ok: false, error: "Некорректная ставка" };
+  if (!currency) return { ok: false, error: "Некорректная валюта" };
   const user = ensureUserBalance(userId);
-  if (user.balance < stake) return { ok: false, error: "Недостаточно средств" };
+  if ((user.balances[currency] || 0) < stake) return { ok: false, error: "Недостаточно средств" };
   const fee = roundMoney(stake * 0.1);
   const pot = roundMoney(stake - fee);
-  user.balance = roundMoney(user.balance - stake);
-  balanceStore.platform.earned = roundMoney((balanceStore.platform.earned || 0) + fee);
-  room.escrow[role] = { userId, stake, pot, fee, locked: true };
+  user.balances[currency] = roundMoney(user.balances[currency] - stake);
+  balanceStore.platform.earned[currency] = roundMoney((balanceStore.platform.earned[currency] || 0) + fee);
+  room.escrow[role] = { userId, stake, currency, pot, fee, locked: true };
   saveStoreAtomic(balanceStore);
   return { ok: true, userId };
 }
@@ -171,8 +435,9 @@ function lockSeatStake(room, role, userKey) {
 function refundSeatStake(room, role) {
   const e = room?.escrow?.[role];
   if (!e || !e.locked) return;
-  ensureUserBalance(e.userId).balance = roundMoney(getBalance(e.userId) + e.stake);
-  balanceStore.platform.earned = roundMoney((balanceStore.platform.earned || 0) - e.fee);
+  const currency = normalizeCurrency(e.currency || room.currency || DEFAULT_CURRENCY) || DEFAULT_CURRENCY;
+  ensureUserBalance(e.userId).balances[currency] = roundMoney(ensureUserBalance(e.userId).balances[currency] + e.stake);
+  balanceStore.platform.earned[currency] = roundMoney((balanceStore.platform.earned[currency] || 0) - e.fee);
   delete room.escrow[role];
   saveStoreAtomic(balanceStore);
 }
@@ -200,6 +465,51 @@ function markFinishChanges(room, state) {
     state.lastFinishGroup = newFinishers;
     if (!state.mainWinner) state.mainWinner = state.finishedOrder[0] || null;
   }
+}
+
+let tgUpdateOffset = 0;
+async function tgApi(method, payload) {
+  if (!process.env.BOT_TOKEN) throw new Error("bot_token_missing");
+  const r = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  return r.json();
+}
+
+function parseStarsPayload(s) {
+  const m = String(s || "").match(/^topup_stars:([^:]+):(\d+):(.+)$/);
+  if (!m) return null;
+  return { userId: m[1], stars: Number(m[2]), nonce: m[3] };
+}
+
+async function processTgUpdate(u) {
+  try {
+    if (u.pre_checkout_query?.id) {
+      await tgApi("answerPreCheckoutQuery", { pre_checkout_query_id: u.pre_checkout_query.id, ok: true });
+    }
+    const sp = u.message?.successful_payment;
+    if (!sp) return;
+    const parsed = parseStarsPayload(sp.invoice_payload);
+    if (!parsed || !parsed.userId || !Number.isInteger(parsed.stars) || parsed.stars <= 0) return;
+    ensureUserBalance(parsed.userId).balances.stars = roundMoney(ensureUserBalance(parsed.userId).balances.stars + parsed.stars);
+    saveStoreAtomic(balanceStore);
+    pushBalanceToUser(parsed.userId);
+  } catch {}
+}
+
+async function pollTelegramUpdates() {
+  if (!process.env.BOT_TOKEN) return;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/getUpdates?timeout=20&offset=${tgUpdateOffset}`);
+    const j = await r.json();
+    if (!j?.ok || !Array.isArray(j.result)) return;
+    for (const upd of j.result) {
+      tgUpdateOffset = Math.max(tgUpdateOffset, Number(upd.update_id || 0) + 1);
+      await processTgUpdate(upd);
+    }
+  } catch {}
 }
 
 
@@ -250,6 +560,10 @@ function roomToListItem(room) {
     winMode: room.winMode,
     allowTransfer: !!room.allowTransfer,
     throwInMode: room.throwInMode || "all",
+    stake: Number(room.stake || DEFAULT_STAKE),
+    currency: room.currency || DEFAULT_CURRENCY,
+    stake: Number(room.stake || DEFAULT_STAKE),
+    currency: room.currency || DEFAULT_CURRENCY,
     playersCount,
     started: !!room.state,
     createdAt: room.createdAt,
@@ -739,6 +1053,7 @@ function settleRoomPayouts(room, state) {
   const roles = Object.keys(room.escrow || {});
   const N = roles.length;
   const S = Number(room.stake || DEFAULT_STAKE);
+  const currency = normalizeCurrency(room.currency || DEFAULT_CURRENCY) || DEFAULT_CURRENCY;
   const basePool = roundMoney(0.9 * N * S);
   const winners = Array.isArray(state.winners) ? state.winners.slice() : [];
   const losers = Array.isArray(state.losers) && state.losers.length ? state.losers.slice() : (state.loser ? [state.loser] : []);
@@ -769,9 +1084,9 @@ function settleRoomPayouts(room, state) {
       nonHardK += 1;
       const refund = roundMoney(0.5 * S);
       perRole[role].refund = refund;
-      ensureUserBalance(perRole[role].userId).balance = roundMoney(getBalance(perRole[role].userId) + refund);
+      ensureUserBalance(perRole[role].userId).balances[currency] = roundMoney(ensureUserBalance(perRole[role].userId).balances[currency] + refund);
       const feeDelta = roundMoney(0.25 * S);
-      balanceStore.platform.earned = roundMoney((balanceStore.platform.earned || 0) + feeDelta);
+      balanceStore.platform.earned[currency] = roundMoney((balanceStore.platform.earned[currency] || 0) + feeDelta);
       platformEarnedDelta = roundMoney(platformEarnedDelta + feeDelta);
     }
     winnersPool = roundMoney(basePool - (0.25 * nonHardK * S));
@@ -785,15 +1100,15 @@ function settleRoomPayouts(room, state) {
       const share = role === mw ? 2 / totalShares : 1 / totalShares;
       const payout = roundMoney(winnersPool * share);
       perRole[role].payout = roundMoney(perRole[role].payout + payout);
-      ensureUserBalance(perRole[role].userId).balance = roundMoney(getBalance(perRole[role].userId) + payout);
+      ensureUserBalance(perRole[role].userId).balances[currency] = roundMoney(ensureUserBalance(perRole[role].userId).balances[currency] + payout);
     }
   } else {
-    balanceStore.platform.earned = roundMoney((balanceStore.platform.earned || 0) + winnersPool);
+    balanceStore.platform.earned[currency] = roundMoney((balanceStore.platform.earned[currency] || 0) + winnersPool);
     platformEarnedDelta = roundMoney(platformEarnedDelta + winnersPool);
   }
 
   saveStoreAtomic(balanceStore);
-  state.payoutBreakdown = { mode, N, S, basePool, winnersPool, winners, losers, mainWinner: mainWinner || null, perRole, platformEarnedDelta };
+  state.payoutBreakdown = { mode, N, S, currency, basePool, winnersPool, winners, losers, mainWinner: mainWinner || null, perRole, platformEarnedDelta };
   for (const p of room.players || []) {
     if (p?.ws && p.userKey) sendBalanceToWs(p.ws, parseUserId(p.userKey));
   }
@@ -1226,6 +1541,8 @@ function sendLobbyState(room) {
         winMode: room.winMode,
         allowTransfer: !!room.allowTransfer,
         throwInMode: room.throwInMode || "all",
+        stake: Number(room.stake || DEFAULT_STAKE),
+        currency: room.currency || DEFAULT_CURRENCY,
         readyDeadlineTs: room.readyDeadlineTs,
         readyTimeoutMs: READY_MS,
         youRole: pl.role,
@@ -1405,7 +1722,7 @@ function leaveRoom(ws) {
  *  Create / Join / Quick
  ======================= */
 
-function createRoomForHost({ hostWs, userKey, profile, maxPlayers, winMode, allowTransfer, throwInMode, isPrivate, password }) {
+function createRoomForHost({ hostWs, userKey, profile, maxPlayers, winMode, allowTransfer, throwInMode, isPrivate, password, stake, currency }) {
   const roomId = randId(isPrivate ? "PR" : "PU");
   const roles = buildRoles(maxPlayers);
 
@@ -1417,7 +1734,8 @@ function createRoomForHost({ hostWs, userKey, profile, maxPlayers, winMode, allo
     winMode,
     allowTransfer: !!allowTransfer,
     throwInMode: throwInMode || "all",
-    stake: DEFAULT_STAKE,
+    stake: Number(stake || DEFAULT_STAKE),
+    currency: normalizeCurrency(currency || DEFAULT_CURRENCY) || DEFAULT_CURRENCY,
     roles,
     createdAt: now(),
     startedAt: null,
@@ -1556,6 +1874,7 @@ wss.on("connection", (ws) => {
       const userKey = safeStr(msg.userKey || "", 128);
       if (!userKey) return;
       const profile = sanitizeProfile(msg.profile);
+      setUserMetaFromProfile(userKey, profile);
 
       if (attachToRoomByUserKey(ws, userKey, profile)) return;
 
@@ -1569,6 +1888,7 @@ wss.on("connection", (ws) => {
       const userKey = safeStr(ws.userKey || "", 128);
       if (!userKey) return;
       const profile = sanitizeProfile(msg.profile);
+      setUserMetaFromProfile(userKey, profile);
       const roomId = ws.roomId;
       if (!roomId) return;
       const room = rooms.get(roomId);
@@ -1593,6 +1913,7 @@ wss.on("connection", (ws) => {
       if (!userKey) { send(ws, { type:"error", message:"Нет userKey" }); return; }
 
       const profile = sanitizeProfile(msg.profile);
+      setUserMetaFromProfile(userKey, profile);
 
       // Быстрая игра: переводной + подкид ото всех (стандарт)
       const winMode = randomChoice(["classic", "draw"]);
@@ -1626,7 +1947,9 @@ wss.on("connection", (ws) => {
         allowTransfer,
         throwInMode,
         isPrivate: false,
-        password: ""
+        password: "",
+        stake: 1,
+        currency: "ton"
       });
 
       if (!room) return;
@@ -1670,6 +1993,7 @@ wss.on("connection", (ws) => {
       if (!userKey) { send(ws, { type:"error", message:"Нет userKey" }); return; }
 
       const profile = sanitizeProfile(msg.profile);
+      setUserMetaFromProfile(userKey, profile);
       const requestedPlayers = Number(msg.maxPlayers);
       if (!Number.isInteger(requestedPlayers) || requestedPlayers < 2 || requestedPlayers > 6) {
         send(ws, { type:"error", message:"Некорректное количество игроков" });
@@ -1681,8 +2005,20 @@ wss.on("connection", (ws) => {
       const throwInMode = (msg.throwInMode === "neighbors" && maxPlayers >= 4) ? "neighbors" : "all";
       const isPrivate = !!msg.isPrivate;
       const password = safeStr(msg.password || "", 32);
+      const currency = normalizeCurrency(msg.currency || DEFAULT_CURRENCY);
+      const stake = Number(msg.stake);
+      if (!currency) { send(ws, { type:"error", message:"Некорректная валюта" }); return; }
+      if (!Number.isFinite(stake) || stake <= 0) { send(ws, { type:"error", message:"Некорректная ставка" }); return; }
+      if (currency === "ton" && (!Number.isInteger(stake) || stake < 1 || stake % 1 !== 0)) {
+        send(ws, { type:"error", message:"Ставка TON: минимум 1, шаг 1" });
+        return;
+      }
+      if (currency === "stars" && (!Number.isInteger(stake) || stake < 50 || stake % 50 !== 0)) {
+        send(ws, { type:"error", message:"Ставка Stars: минимум 50, шаг 50" });
+        return;
+      }
 
-      createRoomForHost({ hostWs: ws, userKey, profile, maxPlayers, winMode, allowTransfer, throwInMode, isPrivate, password });
+      createRoomForHost({ hostWs: ws, userKey, profile, maxPlayers, winMode, allowTransfer, throwInMode, isPrivate, password, stake, currency });
       return;
     }
 
@@ -1692,6 +2028,7 @@ wss.on("connection", (ws) => {
       if (!userKey) { send(ws, { type:"error", message:"Нет userKey" }); return; }
 
       const profile = sanitizeProfile(msg.profile);
+      setUserMetaFromProfile(userKey, profile);
       const roomId = safeStr(msg.roomId || "", 64);
       const password = safeStr(msg.password || "", 32);
 
@@ -1800,4 +2137,8 @@ server.on("upgrade", (req, socket, head) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🃏 Durak WS started on ws://0.0.0.0:${PORT}/ws`);
+  if (process.env.BOT_TOKEN) {
+    setInterval(() => { pollTelegramUpdates(); }, 2500);
+    pollTelegramUpdates();
+  }
 });
