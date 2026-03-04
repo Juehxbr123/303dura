@@ -512,6 +512,108 @@ async function pollTelegramUpdates() {
   } catch {}
 }
 
+function roundMoney(v) {
+  return Math.round((Number(v) || 0) * 100) / 100;
+}
+
+function lockSeatStake(room, role, userKey) {
+  const userId = parseUserId(userKey);
+  if (!userId) return { ok: false, error: "Нет userId" };
+  const stake = Number(room.stake || DEFAULT_STAKE);
+  const currency = normalizeCurrency(room.currency || DEFAULT_CURRENCY);
+  if (!Number.isFinite(stake) || stake <= 0) return { ok: false, error: "Некорректная ставка" };
+  if (!currency) return { ok: false, error: "Некорректная валюта" };
+  const user = ensureUserBalance(userId);
+  if ((user.balances[currency] || 0) < stake) return { ok: false, error: "Недостаточно средств" };
+  const fee = roundMoney(stake * 0.1);
+  const pot = roundMoney(stake - fee);
+  user.balances[currency] = roundMoney(user.balances[currency] - stake);
+  balanceStore.platform.earned[currency] = roundMoney((balanceStore.platform.earned[currency] || 0) + fee);
+  room.escrow[role] = { userId, stake, currency, pot, fee, locked: true };
+  saveStoreAtomic(balanceStore);
+  return { ok: true, userId };
+}
+
+function refundSeatStake(room, role) {
+  const e = room?.escrow?.[role];
+  if (!e || !e.locked) return;
+  const currency = normalizeCurrency(e.currency || room.currency || DEFAULT_CURRENCY) || DEFAULT_CURRENCY;
+  ensureUserBalance(e.userId).balances[currency] = roundMoney(ensureUserBalance(e.userId).balances[currency] + e.stake);
+  balanceStore.platform.earned[currency] = roundMoney((balanceStore.platform.earned[currency] || 0) - e.fee);
+  delete room.escrow[role];
+  saveStoreAtomic(balanceStore);
+}
+
+function markHardLose(room, state, role) {
+  if (!state || !role) return;
+  if (!state.hardLoseRoles) state.hardLoseRoles = {};
+  state.hardLoseRoles[role] = true;
+}
+
+function markFinishChanges(room, state) {
+  if (!state || !state.players) return;
+  if (!state.finishedSet) state.finishedSet = {};
+  if (!Array.isArray(state.finishedOrder)) state.finishedOrder = [];
+  const newFinishers = [];
+  for (const role of room.roles) {
+    const handLen = state.players?.[role]?.hand?.length ?? 0;
+    if (handLen === 0 && !state.finishedSet[role]) newFinishers.push(role);
+  }
+  if (newFinishers.length > 0) {
+    for (const role of newFinishers) {
+      state.finishedSet[role] = true;
+      state.finishedOrder.push(role);
+    }
+    state.lastFinishGroup = newFinishers;
+    if (!state.mainWinner) state.mainWinner = state.finishedOrder[0] || null;
+  }
+}
+
+let tgUpdateOffset = 0;
+async function tgApi(method, payload) {
+  if (!process.env.BOT_TOKEN) throw new Error("bot_token_missing");
+  const r = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  return r.json();
+}
+
+function parseStarsPayload(s) {
+  const m = String(s || "").match(/^topup_stars:([^:]+):(\d+):(.+)$/);
+  if (!m) return null;
+  return { userId: m[1], stars: Number(m[2]), nonce: m[3] };
+}
+
+async function processTgUpdate(u) {
+  try {
+    if (u.pre_checkout_query?.id) {
+      await tgApi("answerPreCheckoutQuery", { pre_checkout_query_id: u.pre_checkout_query.id, ok: true });
+    }
+    const sp = u.message?.successful_payment;
+    if (!sp) return;
+    const parsed = parseStarsPayload(sp.invoice_payload);
+    if (!parsed || !parsed.userId || !Number.isInteger(parsed.stars) || parsed.stars <= 0) return;
+    ensureUserBalance(parsed.userId).balances.stars = roundMoney(ensureUserBalance(parsed.userId).balances.stars + parsed.stars);
+    saveStoreAtomic(balanceStore);
+    pushBalanceToUser(parsed.userId);
+  } catch {}
+}
+
+async function pollTelegramUpdates() {
+  if (!process.env.BOT_TOKEN) return;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/getUpdates?timeout=20&offset=${tgUpdateOffset}`);
+    const j = await r.json();
+    if (!j?.ok || !Array.isArray(j.result)) return;
+    for (const upd of j.result) {
+      tgUpdateOffset = Math.max(tgUpdateOffset, Number(upd.update_id || 0) + 1);
+      await processTgUpdate(upd);
+    }
+  } catch {}
+}
+
 
 /** ======================
  *  Data
@@ -1045,6 +1147,73 @@ function createNewGame(room) {
   markFinishChanges(room, state);
 
   return state;
+}
+
+function settleRoomPayouts(room, state) {
+  if (!state || state.payoutBreakdown) return;
+  const mode = room.winMode;
+  const roles = Object.keys(room.escrow || {});
+  const N = roles.length;
+  const S = Number(room.stake || DEFAULT_STAKE);
+  const currency = normalizeCurrency(room.currency || DEFAULT_CURRENCY) || DEFAULT_CURRENCY;
+  const basePool = roundMoney(0.9 * N * S);
+  const winners = Array.isArray(state.winners) ? state.winners.slice() : [];
+  const losers = Array.isArray(state.losers) && state.losers.length ? state.losers.slice() : (state.loser ? [state.loser] : []);
+  let mainWinner = state.mainWinner || (state.finishedOrder?.[0] || null);
+  if (mainWinner && !winners.includes(mainWinner)) mainWinner = winners[0] || null;
+
+  let winnersPool = basePool;
+  let platformEarnedDelta = 0;
+  const perRole = {};
+  const hardLoseRoles = state.hardLoseRoles || {};
+  for (const role of roles) {
+    const e = room.escrow?.[role] || null;
+    perRole[role] = {
+      userId: e?.userId || null,
+      stake: e?.stake || S,
+      fee: e?.fee || roundMoney(S * 0.1),
+      pot: e?.pot || roundMoney(S * 0.9),
+      hardLose: !!hardLoseRoles[role],
+      payout: 0,
+      refund: 0
+    };
+  }
+
+  if (mode === "draw") {
+    let nonHardK = 0;
+    for (const role of losers) {
+      if (hardLoseRoles[role]) continue;
+      nonHardK += 1;
+      const refund = roundMoney(0.5 * S);
+      perRole[role].refund = refund;
+      ensureUserBalance(perRole[role].userId).balances[currency] = roundMoney(ensureUserBalance(perRole[role].userId).balances[currency] + refund);
+      const feeDelta = roundMoney(0.25 * S);
+      balanceStore.platform.earned[currency] = roundMoney((balanceStore.platform.earned[currency] || 0) + feeDelta);
+      platformEarnedDelta = roundMoney(platformEarnedDelta + feeDelta);
+    }
+    winnersPool = roundMoney(basePool - (0.25 * nonHardK * S));
+  }
+
+  const W = winners.length;
+  if (W > 0) {
+    const totalShares = W + 1;
+    const mw = mainWinner || winners[0];
+    for (const role of winners) {
+      const share = role === mw ? 2 / totalShares : 1 / totalShares;
+      const payout = roundMoney(winnersPool * share);
+      perRole[role].payout = roundMoney(perRole[role].payout + payout);
+      ensureUserBalance(perRole[role].userId).balances[currency] = roundMoney(ensureUserBalance(perRole[role].userId).balances[currency] + payout);
+    }
+  } else {
+    balanceStore.platform.earned[currency] = roundMoney((balanceStore.platform.earned[currency] || 0) + winnersPool);
+    platformEarnedDelta = roundMoney(platformEarnedDelta + winnersPool);
+  }
+
+  saveStoreAtomic(balanceStore);
+  state.payoutBreakdown = { mode, N, S, currency, basePool, winnersPool, winners, losers, mainWinner: mainWinner || null, perRole, platformEarnedDelta };
+  for (const p of room.players || []) {
+    if (p?.ws && p.userKey) sendBalanceToWs(p.ws, parseUserId(p.userKey));
+  }
 }
 
 function settleRoomPayouts(room, state) {
@@ -1755,6 +1924,12 @@ function createRoomForHost({ hostWs, userKey, profile, maxPlayers, winMode, allo
     return null;
   }
 
+  const lock = lockSeatStake(room, "p1", userKey);
+  if (!lock.ok) {
+    send(hostWs, { type:"error", message: lock.error || "Недостаточно средств" });
+    return null;
+  }
+
   const host = { ws: hostWs, userKey, role:"p1", profile, ready:false };
   room.players.push(host);
 
@@ -1874,7 +2049,7 @@ wss.on("connection", (ws) => {
       const userKey = safeStr(msg.userKey || "", 128);
       if (!userKey) return;
       const profile = sanitizeProfile(msg.profile);
-      setUserMetaFromProfile(userKey, profile);
+      setUserMetaFromProfile(parseUserId(userKey), profile);
 
       if (attachToRoomByUserKey(ws, userKey, profile)) return;
 
@@ -1888,7 +2063,7 @@ wss.on("connection", (ws) => {
       const userKey = safeStr(ws.userKey || "", 128);
       if (!userKey) return;
       const profile = sanitizeProfile(msg.profile);
-      setUserMetaFromProfile(userKey, profile);
+      setUserMetaFromProfile(parseUserId(userKey), profile);
       const roomId = ws.roomId;
       if (!roomId) return;
       const room = rooms.get(roomId);
@@ -1908,22 +2083,31 @@ wss.on("connection", (ws) => {
   }
 
   // QUICK
-  if (msg.type === "quick_start") {
+  if (msg.type === "quick_start" || msg.type === "quick_match") {
       const userKey = safeStr(ws.userKey || msg.userKey || "", 128);
       if (!userKey) { send(ws, { type:"error", message:"Нет userKey" }); return; }
 
       const profile = sanitizeProfile(msg.profile);
-      setUserMetaFromProfile(userKey, profile);
+      setUserMetaFromProfile(parseUserId(userKey), profile);
+
+      const quickCurrency = "stars";
+      const quickStake = Number(msg.stake || 50);
+      if (!Number.isInteger(quickStake) || quickStake < 50 || quickStake % 50 !== 0) {
+        send(ws, { type:"error", message:"Ставка Stars: минимум 50, шаг 50" });
+        return;
+      }
 
       // Быстрая игра: переводной + подкид ото всех (стандарт)
       const winMode = randomChoice(["classic", "draw"]);
       const allowTransfer = true;
       const throwInMode = "all";
 
-      // 1) ищем любое свободное публичное лобби (не приватное), где игра ещё не идёт
+      // 1) ищем любое свободное публичное stars-лобби с той же ставкой
       let found = null;
       for (const r of rooms.values()) {
         if (!r || r.isPrivate) continue;
+        if ((r.currency || DEFAULT_CURRENCY) !== quickCurrency) continue;
+        if (Number(r.stake || 0) !== quickStake) continue;
         if (r.state?.phase && r.state.phase !== "lobby") continue; // игра уже идёт/закончена
         const playersCount = (r.players || []).length;
         if (playersCount >= (r.maxPlayers || 2)) continue;
@@ -1948,8 +2132,8 @@ wss.on("connection", (ws) => {
         throwInMode,
         isPrivate: false,
         password: "",
-        stake: 1,
-        currency: "ton"
+        stake: quickStake,
+        currency: quickCurrency
       });
 
       if (!room) return;
@@ -1993,7 +2177,7 @@ wss.on("connection", (ws) => {
       if (!userKey) { send(ws, { type:"error", message:"Нет userKey" }); return; }
 
       const profile = sanitizeProfile(msg.profile);
-      setUserMetaFromProfile(userKey, profile);
+      setUserMetaFromProfile(parseUserId(userKey), profile);
       const requestedPlayers = Number(msg.maxPlayers);
       if (!Number.isInteger(requestedPlayers) || requestedPlayers < 2 || requestedPlayers > 6) {
         send(ws, { type:"error", message:"Некорректное количество игроков" });
@@ -2028,7 +2212,7 @@ wss.on("connection", (ws) => {
       if (!userKey) { send(ws, { type:"error", message:"Нет userKey" }); return; }
 
       const profile = sanitizeProfile(msg.profile);
-      setUserMetaFromProfile(userKey, profile);
+      setUserMetaFromProfile(parseUserId(userKey), profile);
       const roomId = safeStr(msg.roomId || "", 64);
       const password = safeStr(msg.password || "", 32);
 

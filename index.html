@@ -888,12 +888,17 @@
         <div class="muted" id="balanceBreakdown" style="margin-top:6px;">TON: 0 • STARS: 0</div>
         <div id="tonConnectMount" style="margin-top:8px;"></div>
         <button class="btn gray" id="btnCheckTon" style="display:none; margin-top:8px;">Проверить оплату TON</button>
+        <div class="muted" id="tonOrderInfo" style="margin-top:6px; white-space:pre-wrap;"></div>
 
         <div style="height:12px;"></div>
 
         <div class="row" style="justify-content:space-between; gap:12px;">
           <div class="col" style="flex:1; min-width: 220px;">
             <div class="muted">Быстрая игра</div>
+            <div class="row" style="align-items:center; gap:10px; margin-bottom:8px;">
+              <div class="muted" id="quickStakeLabel">Ставка: 50 ⭐</div>
+              <input class="input" id="quickStakeInput" type="number" min="50" step="50" value="50" style="max-width:120px;" />
+            </div>
             <div class="row">
               <button class="btn blue" id="btnQuick">Быстрая игра</button>
               <button class="btn gray" id="btnQuickCancel" style="display:none;">Отменить</button>
@@ -1029,7 +1034,8 @@
         <div style="height:12px;"></div>
 
         <div class="row">
-          <button class="btn green" id="btnCreate">Создать</button>
+          <button class="btn green" id="btnCreateTon">Создать TON лобби</button>
+          <button class="btn blue" id="btnCreateStars">Создать STARS лобби</button>
         </div>
 
         <div class="err" id="errCreate"></div>
@@ -1407,6 +1413,19 @@
   // ===== Quick match
   const btnQuick = document.getElementById("btnQuick");
   const btnQuickCancel = document.getElementById("btnQuickCancel");
+  const quickStakeInput = document.getElementById("quickStakeInput");
+  const quickStakeLabel = document.getElementById("quickStakeLabel");
+  let quickStake = 50;
+  function renderQuickStake() {
+    if (!Number.isInteger(quickStake) || quickStake < 50 || quickStake % 50 !== 0) quickStake = 50;
+    quickStakeInput.value = String(quickStake);
+    quickStakeLabel.textContent = `Ставка: ${quickStake} ⭐`;
+  }
+  quickStakeInput.oninput = () => {
+    quickStake = Math.max(50, Math.round(Number(quickStakeInput.value || 0) / 50) * 50);
+    renderQuickStake();
+  };
+  renderQuickStake();
   function updateQuickUI(){
     btnQuick.style.display = quickSearching ? "none" : "inline-block";
     btnQuickCancel.style.display = quickSearching ? "inline-block" : "none";
@@ -1414,7 +1433,7 @@
   updateQuickUI();
 
   btnQuick.onclick = () => {
-    sendMsg({ type:"quick_start", userKey, profile });
+    sendMsg({ type:"quick_match", userKey, profile, stake: quickStake, currency:"stars" });
   };
   btnQuickCancel.onclick = () => {
     sendMsg({ type:"quick_cancel", userKey });
@@ -1422,6 +1441,7 @@
 
   const btnTopup = document.getElementById("btnTopup");
   const btnCheckTon = document.getElementById("btnCheckTon");
+  const tonOrderInfo = document.getElementById("tonOrderInfo");
   const tonConnectManifestUrl = location.origin + "/tonconnect-manifest.json";
   const tonConnectUI = (window.TON_CONNECT_UI && inTG)
     ? new TON_CONNECT_UI.TonConnectUI({ manifestUrl: tonConnectManifestUrl, buttonRootId: "tonConnectMount" })
@@ -1490,6 +1510,7 @@
         if (!o.ok || !ord.ok) throw new Error(ord.error || "order_failed");
         pendingTonOrder = ord;
         btnCheckTon.style.display = "inline-block";
+        tonOrderInfo.textContent = `Отправьте TON:\nКуда: ${ord.to}\nСумма (nano): ${ord.amountNano}\nКомментарий: ${ord.comment}`;
         let payload = "";
         if (window.TonWeb) {
           const cell = new TonWeb.boc.Cell();
@@ -1523,6 +1544,7 @@
       alert("TON начислены");
       pendingTonOrder = null;
       btnCheckTon.style.display = "none";
+      tonOrderInfo.textContent = "";
     } catch {
       alert("Ошибка проверки");
     }
@@ -1692,7 +1714,7 @@
   }
 
   const errCreate = document.getElementById("errCreate");
-  document.getElementById("btnCreate").onclick = () => {
+  function submitCreate(forceCurrency){
     errCreate.textContent = "";
     const pass = (passInput.value || "").trim();
     if (createPrivate && pass.length < 1) {
@@ -1707,6 +1729,14 @@
       localStorage.setItem("evil_roomPass", "");
     }
 
+    const finalCurrency = forceCurrency || createCurrency;
+    let finalStake = Number(createStake);
+    if (finalCurrency === "ton") {
+      finalStake = Math.max(1, Math.round(finalStake));
+    } else {
+      finalStake = Math.max(50, Math.round(finalStake / 50) * 50);
+    }
+
     sendMsg({
       type:"create_lobby",
       userKey,
@@ -1715,12 +1745,14 @@
       winMode: createWinMode,
       allowTransfer: createTransfer,
       throwInMode: createThrowInMode,
-      stake: createStake,
-      currency: createCurrency,
+      stake: finalStake,
+      currency: finalCurrency,
       isPrivate: createPrivate,
       password: createPrivate ? pass : ""
     });
-  };
+  }
+  document.getElementById("btnCreateTon").onclick = () => submitCreate("ton");
+  document.getElementById("btnCreateStars").onclick = () => submitCreate("stars");
 
   // ===== Lists render
   const listPublic = document.getElementById("listPublic");
@@ -2173,7 +2205,8 @@
     transferZone.classList.remove("show");
     renderDiscardPile(null);
 
-    statusEl.textContent = `Лобби: ${lobbyState.players.filter(p=>p.userKey).length}/${lobbyState.maxPlayers}`;
+    const ls = lobbyState.currency === "stars" ? `${lobbyState.stake} ⭐` : `${lobbyState.stake} TON`;
+    statusEl.textContent = `Лобби: ${lobbyState.players.filter(p=>p.userKey).length}/${lobbyState.maxPlayers} • Ставка: ${ls}`;
     if (modeBadges) {
       modeBadges.innerHTML = "";
       modeBadges.appendChild(buildModeIcons(lobbyState));
@@ -2263,9 +2296,9 @@
     const anyOnTable = (gameState.table || []).some(p => p);
     const allDef = anyOnTable && (gameState.table || []).filter(Boolean).every(p => p.defend);
 
-    statusEl.textContent = gameState.phase === "finished"
-      ? ""
-      : (gameState.activeRole === me ? "Ваш ход" : "");
+    const gs = gameState.currency === "stars" ? `${gameState.stake} ⭐` : `${gameState.stake} TON`;
+    const baseStatus = gameState.phase === "finished" ? "" : (gameState.activeRole === me ? "Ваш ход" : "");
+    statusEl.textContent = `${baseStatus}${baseStatus ? " • " : ""}Ставка: ${gs}`;
     if (modeBadges) {
       modeBadges.innerHTML = "";
       modeBadges.style.display = "none";
